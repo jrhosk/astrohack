@@ -24,7 +24,7 @@ def _convert_from_datetime(time:numpy.ndarray):
 
     return time.astype('float64')*(1e-9) + 3506716800.0
 
-#@nb.njit(cache=True)
+@nb.jit(nopython=True, cache=True)
 def _get_nearest_time_value(value:numpy.ndarray, times:xarray.core.dataset.Dataset)->numpy.ndarray:
     """_summary_
 
@@ -89,9 +89,6 @@ def _make_baseline_to_antenna_map(msdx: xarray.core.dataset.Dataset) -> dict:
 
     antenna1_list = msdx.ANTENNA1.data.compute()
     antenna2_list = msdx.ANTENNA2.data.compute()
-
-    #baseline_map = {}
-    
 
     baseline_map = Dict.empty(
         key_type=types.int64,
@@ -161,91 +158,55 @@ def _build_pointing_table_filter_indicies(pointing:xarray.core.dataarray.DataArr
 
     return index_dict
 
-#@nb.jit(nopython=True, cache=True)
+@nb.jit(nopython=True, cache=True)
 def _select_by_antenna(data, device_list, device_id, type='value'):
-    """_summary_
-
-    Args:
-        data (_type_): _description_
-        device_list (_type_): _description_
-        device_id (_type_): _description_
-        type (str, optional): _description_. Defaults to 'value'.
-
-    Returns:
-        _type_: _description_
-    """
     if type == 'value':
-        for i, device in enumerate(device_list):
-            if device == device_id:
-                index = i
-                
-            else:
-                pass
+        index = numpy.where(device_list==device_id)[0][0]
+        
     else:
         index = device_id
         
-    return data[:, index::4, ...]
+    return data[:, index::4, ...][:, :, 0, :]
 
-#@nb.jit(nopython=True, cache=True)
-def _select_by_time(data, time_list, value, type='value'):
-    """_summary_
 
-    Args:
-        data (_type_): _description_
-        device_list (_type_): _description_
-        device_id (_type_): _description_
-        type (str, optional): _description_. Defaults to 'value'.
-
-    Returns:
-        _type_: _description_
-    """
-    #if type == 'value':
-    #    for i, time in enumerate(time_list):
-    #        if time == value:
-    #            index = i
-    #        else:
-    #            pass
-    #else:
-    #    index = value
-    index = value
-
-    return data[index, ...]
-
-#@nb.jit(nopython=True, cache=True)
-def _build_pointing_table(direction, data, time_centroid, map, antenna_list, time_list, time_list_numerical, pointing_index_dict, n_time_centroids, n_baselines)->numpy.ndarray:
-  
-    #for time in tqdm.trange(n_time_centroids):
-    #    for baseline in range(n_baselines):
-    for time in range(2):
-        for baseline in range(2):
-            antennas = map[baseline]
+@nb.jit(nopython=True, cache=True)
+def _build_pointing_table(direction_data, data, time_centroid, antenna_map, antenna_list, pointing_times, pointing_index_dict, n_time_centroids, n_baselines)->numpy.ndarray:
+    print('Time iteration: ')
+    for time in range(n_time_centroids):
+        print(time)
+        for baseline in range(n_baselines):
+            antennas = antenna_map[baseline]
             
-            for n, antenna in enumerate(antennas):          
-                
-                subtable = pointing.sel(antenna_id=antenna).isel(time=pointing_index_dict[antenna])
-                
-                pointing_datetimes = subtable.coords['time'].data
-                
-                pointing_times = _convert_from_datetime(pointing_datetimes)
-                                                
-                index, nearest_time = _get_nearest_time_value(time_centroid[time, baseline], pointing_times)             
-                
-                datetime_index = numpy.where(numpy.datetime64(pointing_datetimes[index]) == pointing_datetimes)[0]
-                
-                direction = subtable.isel(time=datetime_index).DIRECTION.data.compute()
+            for n, antenna in enumerate(antennas):     
+                # Find the antenna_id index     
+                index = numpy.where(antenna_list==antenna)[0][0]
 
-                direction = numpy.squeeze(direction)
+                # Get the subtable for the given antenna_id and get rid of
+                # the additinoal dimension
+                c_subtable = direction_data[:, index::4, ...][:, :, 0, :]
 
-                data[time, baseline, 0, RA] = direction[RA]
-                data[time, baseline, 0, DEC] = direction[DEC]
+                # Use the filter to get only the time valu entries that are
+                # no NaN from the subtable.
+                c_subtable = c_subtable[pointing_index_dict[antenna]]
 
-            
+                # Get the index of the nearest pointing time compared to the
+                # time centroid value.
+                index, _ = _get_nearest_time_value(
+                    time_centroid[time, antenna], 
+                    pointing_times[pointing_index_dict[antenna]]
+                )
+
+                # Get the direction (RA, DEC) values for the relevant time.
+                direction = c_subtable[index, ...][0]
+
+                # Write values to the new pointing table.
+                data[time, baseline, n, 0] = direction[0]
+                data[time, baseline, n, 1] = direction[1]            
     
     return data
     
 
-
-if __name__ == '__main__':
+def build_pointing_table(infile=''):
     
     N_ANTENNAS = 2
     N_DIRECTIONS = 2
@@ -257,11 +218,13 @@ if __name__ == '__main__':
               'POLARIZATION', 'SOURCE',
               'STATE', 'SYSCAL', 'SYSPOWER', 'WEATHER', 'OVER_THE_TOP']
 
-    if os.path.exists('evla_bctest.vis.zarr'):
-        msdx = dio.read_vis(infile='evla_bctest.vis.zarr')
+    infile = 'group1.ms'
+
+    if os.path.exists(infile.split('.')[0] + '.vis.zarr'):
+        msdx = dio.read_vis(infile=infile.split('.')[0] + '.vis.zarr')
 
     else:
-        msdx = conversion.convert_ms(infile='evla_bctest.ms') 
+        msdx = conversion.convert_ms(infile=infile) 
 
     spectral_windows = _get_spw_list(msdx)
     pointing = msdx.POINTING
@@ -270,30 +233,29 @@ if __name__ == '__main__':
     start = perf_counter()
 
     for spw in tqdm.tqdm(spectral_windows, desc='processing spectral windows ...'):
+    #windows = ['xds7']
+    #for spw in tqdm.tqdm(windows, desc='processing spectral windows ...'):
         time_centroid = msdx.attrs[spw].TIME_CENTROID.data.compute()
-        map = _make_baseline_to_antenna_map(msdx=msdx.attrs[spw])
+        antenna_map = _make_baseline_to_antenna_map(msdx=msdx.attrs[spw])
 
         antenna_list = pointing.coords['antenna_id'].data
         time_list = pointing.coords['time'].data
         
-        print('filtering ...')
         pointing_index_dict = _build_pointing_table_filter_indicies(pointing, antenna_list)
 
         n_time_centroids, n_baselines = msdx.attrs[spw].TIME_CENTROID.shape
 
         data = numpy.zeros([n_time_centroids, n_baselines, N_ANTENNAS, N_DIRECTIONS])
+        pointing_times = _convert_from_datetime(time_list)
 
-        pointing_datetimes = numpy.take(time_list, pointing_index_dict[0])
-        time_list_numerical = _convert_from_datetime(time_list)
-
-        print('building ...')
+        print('building pointing table ...')
         data = _build_pointing_table(
             pointing_direction_array, 
             data, 
             time_centroid, 
-            map, antenna_list, 
-            time_list, 
-            time_list_numerical, 
+            antenna_map, 
+            antenna_list, 
+            pointing_times, 
             pointing_index_dict, 
             n_time_centroids, 
             n_baselines
